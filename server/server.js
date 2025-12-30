@@ -28,11 +28,8 @@ const execAsync = promisify(exec);
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(cors({
-  origin: ['chrome-extension://*', 'http://localhost:*'],
-  credentials: true
-}));
+// Middleware - Allow all origins for development
+app.use(cors());
 app.use(express.json());
 
 // Initialize clients
@@ -69,9 +66,13 @@ async function cleanupTempFiles(files) {
  * Search Listen Notes API for podcast episode
  */
 async function searchListenNotes(title, showName) {
-  const query = `${title} ${showName}`.trim();
-  
   try {
+    // Search with show name as primary, title as secondary for better accuracy
+    // Put show name in quotes to prioritize exact match
+    const query = showName ? `"${showName}" ${title}` : title;
+    
+    console.log(`Searching Listen Notes for: ${query}`);
+    
     const response = await axios.get('https://listen-api.listennotes.com/api/v2/search', {
       headers: {
         'X-ListenAPI-Key': process.env.LISTENNOTES_API_KEY
@@ -85,7 +86,24 @@ async function searchListenNotes(title, showName) {
     });
     
     if (response.data.results && response.data.results.length > 0) {
-      const episode = response.data.results[0];
+      // Try to find a result that matches the show name
+      let episode = response.data.results[0];
+      
+      if (showName) {
+        const showNameLower = showName.toLowerCase();
+        const matchingEpisode = response.data.results.find(ep => {
+          const podcastName = (ep.podcast?.title_original || '').toLowerCase();
+          return podcastName.includes(showNameLower) || showNameLower.includes(podcastName);
+        });
+        
+        if (matchingEpisode) {
+          episode = matchingEpisode;
+          console.log(`Found matching episode: "${episode.title_original}" from "${episode.podcast?.title_original}"`);
+        } else {
+          console.log(`Warning: No exact show match found. Using best result: "${episode.podcast?.title_original}"`);
+        }
+      }
+      
       return {
         id: episode.id,
         title: episode.title_original,
@@ -159,13 +177,13 @@ function extractTranscriptSegment(transcript, timestampSeconds, duration = 30) {
 }
 
 /**
- * Download and crop audio using yt-dlp and ffmpeg
+ * Download and crop audio using curl + ffmpeg
  */
 async function extractAudioSnippet(audioUrl, timestampSeconds, duration = 30) {
   await ensureTempDir();
   
   const timestamp = Date.now();
-  const tempAudioPath = path.join(TEMP_DIR, `audio_${timestamp}.mp3`);
+  const fullAudioPath = path.join(TEMP_DIR, `full_${timestamp}.mp3`);
   const snippetPath = path.join(TEMP_DIR, `snippet_${timestamp}.mp3`);
   
   try {
@@ -173,92 +191,108 @@ async function extractAudioSnippet(audioUrl, timestampSeconds, duration = 30) {
     const startTime = Math.max(0, timestampSeconds - 5);
     const totalDuration = duration + 10; // Extra buffer
     
-    // Use yt-dlp to download audio segment
-    // Note: yt-dlp has limited support for podcast audio URLs, may need direct download
-    try {
-      // First try yt-dlp (works for some podcast hosts)
-      await execAsync(
-        `yt-dlp -x --audio-format mp3 --postprocessor-args "-ss ${startTime} -t ${totalDuration}" -o "${tempAudioPath}" "${audioUrl}"`,
-        { timeout: 60000 }
-      );
-    } catch (ytdlpError) {
-      // Fallback: Direct download with curl + ffmpeg processing
-      console.log('yt-dlp failed, trying direct download...');
-      
-      // Download full audio (or range if server supports it)
-      await execAsync(
-        `curl -L -o "${tempAudioPath}" "${audioUrl}"`,
-        { timeout: 120000 }
-      );
-      
-      // Use ffmpeg to extract the snippet
-      await execAsync(
-        `ffmpeg -y -ss ${startTime} -i "${tempAudioPath}" -t ${totalDuration} -c:a libmp3lame -q:a 4 "${snippetPath}"`,
-        { timeout: 60000 }
-      );
-      
-      // Clean up full audio
-      await fs.unlink(tempAudioPath).catch(() => {});
-      
-      return snippetPath;
+    console.log(`Extracting audio from ${startTime}s for ${totalDuration}s`);
+    console.log(`Audio URL: ${audioUrl.substring(0, 100)}...`);
+    
+    // Step 1: Download with curl using proper headers (Listen Notes blocks direct ffmpeg access)
+    console.log('Downloading audio with curl...');
+    const curlCmd = `curl -L -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" -o "${fullAudioPath}" "${audioUrl}"`;
+    
+    await execAsync(curlCmd, { timeout: 180000 }); // 3 min timeout for download
+    
+    // Verify download
+    const downloadStats = await fs.stat(fullAudioPath);
+    console.log(`Downloaded: ${downloadStats.size} bytes`);
+    
+    if (downloadStats.size < 10000) {
+      throw new Error('Downloaded file too small');
     }
     
-    // If yt-dlp succeeded, the file is at tempAudioPath
-    // Rename to snippetPath for consistency
-    await fs.rename(tempAudioPath, snippetPath);
+    // Step 2: Extract snippet with ffmpeg
+    console.log('Extracting snippet with ffmpeg...');
+    const ffmpegCmd = `ffmpeg -y -ss ${startTime} -i "${fullAudioPath}" -t ${totalDuration} -c:a libmp3lame -q:a 4 -loglevel error "${snippetPath}"`;
+    
+    await execAsync(ffmpegCmd, { timeout: 60000 });
+    
+    // Clean up full audio
+    await fs.unlink(fullAudioPath).catch(() => {});
+    
+    // Verify snippet was created
+    const stats = await fs.stat(snippetPath);
+    console.log(`Audio snippet created: ${stats.size} bytes`);
+    
+    if (stats.size < 1000) {
+      throw new Error('Audio snippet too small - extraction may have failed');
+    }
     
     return snippetPath;
   } catch (error) {
     // Clean up on error
-    await cleanupTempFiles([tempAudioPath, snippetPath]);
+    await cleanupTempFiles([fullAudioPath, snippetPath]);
     console.error('Audio extraction error:', error.message);
-    throw new Error('Failed to extract audio snippet');
+    throw new Error('Failed to extract audio snippet: ' + error.message);
   }
 }
 
 /**
- * Transcribe audio using OpenAI Whisper API
+ * Transcribe audio using Groq's free Whisper API
  */
 async function transcribeWithWhisper(audioPath) {
   try {
+    // Verify file exists
+    const stats = await fs.stat(audioPath);
+    console.log(`Transcribing audio file: ${audioPath} (${stats.size} bytes)`);
+    
     const formData = new FormData();
-    formData.append('file', createReadStream(audioPath));
-    formData.append('model', 'whisper-1');
+    formData.append('file', createReadStream(audioPath), {
+      filename: 'audio.mp3',
+      contentType: 'audio/mpeg'
+    });
+    formData.append('model', 'whisper-large-v3');
     formData.append('response_format', 'text');
     
+    console.log('Sending to Groq Whisper API...');
     const response = await axios.post(
-      'https://api.openai.com/v1/audio/transcriptions',
+      'https://api.groq.com/openai/v1/audio/transcriptions',
       formData,
       {
         headers: {
-          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
           ...formData.getHeaders()
         },
         maxContentLength: Infinity,
-        maxBodyLength: Infinity
+        maxBodyLength: Infinity,
+        timeout: 60000 // 60 second timeout
       }
     );
     
+    console.log('Groq transcription received:', response.data.substring(0, 100) + '...');
     return response.data;
   } catch (error) {
-    console.error('Whisper API error:', error.response?.data || error.message);
-    throw new Error('Failed to transcribe audio');
+    console.error('Groq Whisper API error details:', {
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
+      message: error.message
+    });
+    throw new Error('Failed to transcribe audio: ' + (error.response?.data?.error?.message || error.message));
   }
 }
 
 /**
- * Summarize transcript using GPT-4o-mini
+ * Summarize transcript using Groq's free LLaMA model
  */
 async function summarizeTranscript(transcript, title) {
   try {
+    console.log('Summarizing with Groq LLaMA...');
     const response = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
+      'https://api.groq.com/openai/v1/chat/completions',
       {
-        model: 'gpt-4o-mini',
+        model: 'llama-3.1-8b-instant',
         messages: [
           {
             role: 'system',
-            content: 'You are a helpful assistant that summarizes podcast insights. Create exactly 3 concise bullet points that capture the key takeaways from the transcript. Each bullet should be actionable or insightful. Keep each bullet under 100 characters.'
+            content: 'You are a helpful assistant that summarizes podcast insights. Create exactly 3 concise bullet points that capture the key takeaways from the transcript. Each bullet should be actionable or insightful. Keep each bullet under 100 characters. Format as: - Point one\n- Point two\n- Point three'
           },
           {
             role: 'user',
@@ -270,25 +304,27 @@ async function summarizeTranscript(transcript, title) {
       },
       {
         headers: {
-          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
           'Content-Type': 'application/json'
         }
       }
     );
     
     const content = response.data.choices[0].message.content;
+    console.log('Summary received:', content.substring(0, 100) + '...');
     
     // Parse bullet points
     const bullets = content
       .split('\n')
       .filter(line => line.trim().match(/^[-•*]\s/) || line.trim().match(/^\d+\.\s/))
       .map(line => line.replace(/^[-•*\d.]\s*/, '').trim())
+      .filter(line => line.length > 0)
       .slice(0, 3);
     
     return bullets.length > 0 ? bullets : [content.trim()];
   } catch (error) {
-    console.error('GPT summarization error:', error.response?.data || error.message);
-    throw new Error('Failed to summarize transcript');
+    console.error('Groq summarization error:', error.response?.data || error.message);
+    throw new Error('Failed to summarize transcript: ' + (error.response?.data?.error?.message || error.message));
   }
 }
 
@@ -336,10 +372,25 @@ app.post('/process-insight', async (req, res) => {
     // Step 1: Search Listen Notes for the episode
     const episode = await searchListenNotes(title, showName || '');
     
+    // If episode not found, return success with manual mode flag
     if (!episode) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Could not find podcast episode in Listen Notes' 
+      console.log('Episode not found in Listen Notes - using manual mode');
+      
+      // Log to Supabase (non-blocking)
+      logToSupabase({ title, showName, timestamp: timestampSeconds, spotifyUrl });
+      
+      return res.json({
+        success: true,
+        data: {
+          episodeTitle: title,
+          showName: showName || 'Unknown Show',
+          thumbnail: null,
+          transcript: null,
+          summary: null,
+          timestampSeconds: timestampSeconds,
+          manualMode: true,
+          message: 'Podcast not found in database. You can add your own notes!'
+        }
       });
     }
     
@@ -392,12 +443,12 @@ app.post('/process-insight', async (req, res) => {
     // Log to Supabase (non-blocking)
     logToSupabase({ title, showName, timestamp: timestampSeconds, spotifyUrl });
     
-    // Respond with processed data
+    // Respond with processed data - USE ORIGINAL SPOTIFY DATA for title/show
     res.json({
       success: true,
       data: {
-        episodeTitle: episode.title,
-        showName: episode.showName,
+        episodeTitle: title,  // Use original Spotify title
+        showName: showName || episode.showName,  // Use original Spotify show name
         thumbnail: episode.thumbnail,
         transcript: transcript,
         summary: summary,
@@ -431,13 +482,14 @@ app.post('/save-to-notion', async (req, res) => {
     summary, 
     spotifyUrl, 
     thumbnail,
-    timestampSeconds 
+    timestampSeconds,
+    manualMode 
   } = req.body;
   
-  if (!title || !transcript) {
+  if (!title) {
     return res.status(400).json({ 
       success: false, 
-      message: 'Title and transcript are required' 
+      message: 'Title is required' 
     });
   }
   
@@ -453,12 +505,103 @@ app.post('/save-to-notion', async (req, res) => {
       ? summary.map(s => `• ${s}`).join('\n')
       : summary;
     
+    // Build page content based on whether we have transcript/summary
+    const pageChildren = [];
+    
+    if (summary && summary.length > 0) {
+      // Key Takeaways heading
+      pageChildren.push({
+        object: 'block',
+        type: 'heading_2',
+        heading_2: {
+          rich_text: [{ text: { content: '✨ Key Takeaways' } }]
+        }
+      });
+      // Summary bullets
+      pageChildren.push({
+        object: 'block',
+        type: 'paragraph',
+        paragraph: {
+          rich_text: [{ text: { content: summaryText } }]
+        }
+      });
+      // Divider
+      pageChildren.push({
+        object: 'block',
+        type: 'divider',
+        divider: {}
+      });
+    }
+    
+    if (transcript) {
+      // Transcript heading
+      pageChildren.push({
+        object: 'block',
+        type: 'heading_2',
+        heading_2: {
+          rich_text: [{ text: { content: '📝 Transcript' } }]
+        }
+      });
+      // Transcript content
+      pageChildren.push({
+        object: 'block',
+        type: 'paragraph',
+        paragraph: {
+          rich_text: [
+            { 
+              text: { 
+                content: transcript.substring(0, 2000)
+              } 
+            }
+          ]
+        }
+      });
+    } else {
+      // Manual mode - add placeholder for notes
+      pageChildren.push({
+        object: 'block',
+        type: 'heading_2',
+        heading_2: {
+          rich_text: [{ text: { content: '📝 Your Notes' } }]
+        }
+      });
+      pageChildren.push({
+        object: 'block',
+        type: 'paragraph',
+        paragraph: {
+          rich_text: [
+            { 
+              text: { 
+                content: '(Podcast not found in database - add your own notes here!)'
+              } 
+            }
+          ]
+        }
+      });
+    }
+    
+    // Callout with source
+    pageChildren.push({
+      object: 'block',
+      type: 'callout',
+      callout: {
+        icon: { type: 'emoji', emoji: '🎧' },
+        rich_text: [
+          {
+            text: {
+              content: `From "${showName || 'Unknown Show'}" at ${formatTime(timestampSeconds)}`
+            }
+          }
+        ]
+      }
+    });
+    
     // Create Notion page
     const response = await notion.pages.create({
       parent: { database_id: databaseId },
       icon: {
         type: 'emoji',
-        emoji: '💡'
+        emoji: manualMode ? '✏️' : '💡'
       },
       cover: thumbnail ? {
         type: 'external',
@@ -500,67 +643,7 @@ app.post('/save-to-notion', async (req, res) => {
           }
         }
       },
-      children: [
-        // Key Takeaways heading
-        {
-          object: 'block',
-          type: 'heading_2',
-          heading_2: {
-            rich_text: [{ text: { content: '✨ Key Takeaways' } }]
-          }
-        },
-        // Summary bullets
-        {
-          object: 'block',
-          type: 'paragraph',
-          paragraph: {
-            rich_text: [{ text: { content: summaryText } }]
-          }
-        },
-        // Divider
-        {
-          object: 'block',
-          type: 'divider',
-          divider: {}
-        },
-        // Transcript heading
-        {
-          object: 'block',
-          type: 'heading_2',
-          heading_2: {
-            rich_text: [{ text: { content: '📝 Transcript' } }]
-          }
-        },
-        // Transcript content
-        {
-          object: 'block',
-          type: 'paragraph',
-          paragraph: {
-            rich_text: [
-              { 
-                text: { 
-                  content: transcript.substring(0, 2000) // Notion has text limits
-                } 
-              }
-            ]
-          }
-        },
-        // Callout with source
-        {
-          object: 'block',
-          type: 'callout',
-          callout: {
-            icon: { type: 'emoji', emoji: '🎧' },
-            rich_text: [
-              {
-                text: {
-                  content: `From "${showName}" at ${formatTime(timestampSeconds)}`
-                }
-              }
-            ]
-          }
-        }
-      ]
+      children: pageChildren
     });
     
     console.log(`Saved to Notion: ${response.id}`);

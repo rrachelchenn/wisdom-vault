@@ -51,6 +51,13 @@ function showState(stateName, data = {}) {
       
     case 'success':
       UI.successState.classList.remove('hidden');
+      // Update success message if provided
+      const successTextEl = UI.successState.querySelector('.success-text');
+      if (successTextEl && data.message) {
+        successTextEl.textContent = data.message;
+      } else if (successTextEl) {
+        successTextEl.textContent = 'Saved to your Vault!';
+      }
       UI.saveBtn.disabled = false;
       break;
       
@@ -148,17 +155,39 @@ async function handleSaveInsight() {
     await new Promise(resolve => setTimeout(resolve, 500));
     
     showState('processing', { message: 'Transcribing audio...' });
-    const processedData = await processInsight(spotifyData);
+    const processedResult = await processInsight(spotifyData);
+    
+    // Extract the data from the response
+    const processedData = processedResult.data || processedResult;
+    console.log('Processed data:', processedData);
+    
+    // Check if manual mode (podcast not found)
+    const isManualMode = processedData.manualMode === true;
+    
+    if (isManualMode) {
+      showState('processing', { message: 'Saving bookmark...' });
+    } else {
+      showState('processing', { message: 'Saving to Notion...' });
+    }
     
     // Step 3: Save to Notion
-    showState('processing', { message: 'Saving to Notion...' });
     await saveToNotion({
       ...spotifyData,
-      ...processedData
+      title: processedData.episodeTitle || spotifyData.title,
+      showName: processedData.showName || spotifyData.showName,
+      transcript: processedData.transcript,
+      summary: processedData.summary,
+      thumbnail: processedData.thumbnail,
+      timestampSeconds: processedData.timestampSeconds || spotifyData.timestamp,
+      manualMode: isManualMode
     });
     
     // Success!
-    showState('success');
+    if (isManualMode) {
+      showState('success', { message: 'Saved! Add your own notes in Notion.' });
+    } else {
+      showState('success');
+    }
     
     // Reset after 3 seconds
     setTimeout(() => {

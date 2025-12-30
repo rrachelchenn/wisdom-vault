@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Wisdom Vault",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Save podcast insights from Spotify with AI-powered transcription and summarization",
   "permissions": [
     "activeTab",
@@ -9,7 +9,8 @@
     "storage"
   ],
   "host_permissions": [
-    "https://open.spotify.com/*"
+    "https://open.spotify.com/*",
+    "http://localhost:3001/*"
   ],
   "action": {
     "default_popup": "popup.html",

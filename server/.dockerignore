@@ -1,0 +1,11 @@
+node_modules
+npm-debug.log
+.env
+.env.*
+temp/
+*.mp3
+*.wav
+.DS_Store
+.git
+.gitignore
+

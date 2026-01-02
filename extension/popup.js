@@ -1,5 +1,5 @@
 // Wisdom Vault - Popup Script
-const API_BASE_URL = 'http://localhost:3001';
+const API_BASE_URL = 'https://wisdom-vault-api.onrender.com';
 
 // UI State Management
 const UI = {

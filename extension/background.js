@@ -1,7 +1,7 @@
 // Wisdom Vault - Background Service Worker
 // Handles communication between popup, content scripts, and external APIs
 
-const API_BASE_URL = 'http://localhost:3001';
+const API_BASE_URL = 'https://wisdom-vault-api.onrender.com';
 
 // Store for recent insights
 let recentInsights = [];
